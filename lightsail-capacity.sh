@@ -147,36 +147,84 @@ calculate_capacity() {
   ')"
 }
 
+format_tib() {
+  awk -v gb="$1" 'BEGIN { printf "%.2f", gb/1024 }'
+}
+
+setup_colors() {
+  COLOR_RESET=''
+  COLOR_BOLD=''
+  COLOR_CYAN=''
+  COLOR_GREEN=''
+  COLOR_YELLOW=''
+  COLOR_RED=''
+
+  if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+    COLOR_RESET=$'\033[0m'
+    COLOR_BOLD=$'\033[1m'
+    COLOR_CYAN=$'\033[36m'
+    COLOR_GREEN=$'\033[32m'
+    COLOR_YELLOW=$'\033[33m'
+    COLOR_RED=$'\033[31m'
+  fi
+}
+
+print_section() {
+  printf '\n%s%s── %s ─────────────────────────────────────────%s\n' \
+    "$COLOR_BOLD" "$COLOR_CYAN" "$1" "$COLOR_RESET"
+}
+
 print_report() {
   local used_gb="$1" completed_days="$2" remaining_days="$3" current_count="$4"
   local difference=$((REQUIRED_INSTANCES - current_count))
+  local status_color status_text
 
+  setup_colors
+
+  printf '%s%s╭──────────────────────────────────────────────────────╮%s\n' "$COLOR_BOLD" "$COLOR_CYAN" "$COLOR_RESET"
+  printf '%s%s│  AWS Lightsail 流量容量预测%s\n' "$COLOR_BOLD" "$COLOR_CYAN" "$COLOR_RESET"
+  printf '%s%s╰──────────────────────────────────────────────────────╯%s\n' "$COLOR_BOLD" "$COLOR_CYAN" "$COLOR_RESET"
+
+  print_section '基础信息'
   printf '区域: %s\n' "$REGION"
   if [[ -n "${BUNDLE_ID:-}" ]]; then
     printf '套餐: %s (%.0f GB/月)\n' "$BUNDLE_ID" "$MONTHLY_TRANSFER_GB"
   fi
-  if [[ -n "${BILLED_IN_GB:-}" ]]; then
-    printf '账单入站流量: %.3f GB\n' "$BILLED_IN_GB"
-    printf '账单出站流量: %.3f GB\n' "$BILLED_OUT_GB"
-  fi
   printf '计算日期（UTC）: %s\n' "$AS_OF"
   printf '已完成账单天数: %d 天\n' "$completed_days"
   printf '剩余天数: %d 天\n' "$remaining_days"
-  printf '截至昨天总流量: %.3f GB\n' "$used_gb"
+
+  print_section '流量概览'
+  if [[ -n "${BILLED_IN_GB:-}" ]]; then
+    printf '账单入站流量: %.3f GB  (%s TiB)\n' "$BILLED_IN_GB" "$(format_tib "$BILLED_IN_GB")"
+    printf '账单出站流量: %.3f GB  (%s TiB)\n' "$BILLED_OUT_GB" "$(format_tib "$BILLED_OUT_GB")"
+  fi
+  printf '截至昨天总流量: %.3f GB  (%s TiB)\n' "$used_gb" "$(format_tib "$used_gb")"
   printf '日均总流量: %.3f GB/天\n' "$DAILY_AVERAGE_GB"
-  printf '预计剩余流量: %.3f GB\n' "$FORECAST_REMAINING_GB"
+
+  print_section '月底预测'
+  printf '预计剩余流量: %.3f GB  (%s TiB)\n' "$FORECAST_REMAINING_GB" "$(format_tib "$FORECAST_REMAINING_GB")"
   printf '安全余量: %.1f%%\n' "$(awk -v b="$BUFFER" 'BEGIN { print b*100 }')"
-  printf '含安全余量需求: %.3f GB\n' "$BUFFERED_DEMAND_GB"
-  printf '单台剩余额度: %.3f GB\n' "$PER_INSTANCE_REMAINING_GB"
+  printf '含安全余量需求: %.3f GB  (%s TiB)\n' "$BUFFERED_DEMAND_GB" "$(format_tib "$BUFFERED_DEMAND_GB")"
+
+  print_section '容量建议'
+  printf '单台剩余额度: %.3f GB  (%s TiB)\n' "$PER_INSTANCE_REMAINING_GB" "$(format_tib "$PER_INSTANCE_REMAINING_GB")"
   printf '当前实例数: %d 台\n' "$current_count"
   printf '建议保持实例数: %d 台\n' "$REQUIRED_INSTANCES"
   if (( difference > 0 )); then
     printf '建议新增: %d 台\n' "$difference"
+    status_color="$COLOR_RED"
+    status_text="✗ 容量不足：还需新增 $difference 台实例"
   elif (( difference < 0 )); then
     printf '当前多出: %d 台\n' "$((-difference))"
+    status_color="$COLOR_GREEN"
+    status_text="✓ 容量充足：当前多出 $((-difference)) 台实例"
   else
     printf '当前数量正好，无需调整。\n'
+    status_color="$COLOR_GREEN"
+    status_text='✓ 容量合适：无需调整实例数量'
   fi
+  printf '\n%s%s%s%s\n' "$COLOR_BOLD" "$status_color" "$status_text" "$COLOR_RESET"
 }
 
 while (( $# > 0 )); do

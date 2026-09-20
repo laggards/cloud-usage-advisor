@@ -9,6 +9,7 @@ AS_OF="$(date -u +%F)"
 MOCK_USED_GB=""
 CURRENT_COUNT=""
 BUNDLE_ID=""
+SHOW_DAILY="false"
 
 usage() {
   cat <<'EOF'
@@ -24,6 +25,7 @@ usage() {
   --as-of YYYY-MM-DD              计算日期，默认当前 UTC 日期
   --mock-used-gb GB               不访问账单，使用给定流量测试计算
   --current-count N               模拟模式的当前实例数
+  --daily                         显示本月截至昨天的每日账单流量
   -h, --help                      显示帮助
 EOF
 }
@@ -91,7 +93,7 @@ fetch_billed_transfer_gb() {
   filter_json="$(jq -nc --arg region "$REGION" '{And:[{Dimensions:{Key:"SERVICE",Values:["Amazon Lightsail"]}},{Dimensions:{Key:"REGION",Values:[$region]}}]}')"
   if ! usage_json="$(aws ce get-cost-and-usage \
     --time-period "Start=${MONTH_START},End=${AS_OF}" \
-    --granularity MONTHLY \
+    --granularity DAILY \
     --metrics UsageQuantity \
     --group-by Type=DIMENSION,Key=USAGE_TYPE \
     --filter "$filter_json" \
@@ -101,6 +103,12 @@ fetch_billed_transfer_gb() {
 
   jq -e '(.ResultsByTime | type) == "array" and all(.ResultsByTime[]; (.Groups | type) == "array")' \
     >/dev/null 2>&1 <<<"$usage_json" || die "Cost Explorer 响应结构无效"
+  jq -e 'all(.ResultsByTime[];
+    (.TimePeriod.Start | type) == "string"
+    and (.TimePeriod.Start | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"))
+    and (.TimePeriod.End | type) == "string"
+    and (.TimePeriod.End | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"))
+  )' >/dev/null 2>&1 <<<"$usage_json" || die "Cost Explorer 日期结构无效"
   if ! transfer_records="$(jq -c '[
     .ResultsByTime[].Groups[]
     | select((.Keys | type) == "array" and (.Keys | length) > 0)
@@ -115,6 +123,20 @@ fetch_billed_transfer_gb() {
 
   BILLED_IN_GB="$(jq -r '[.[] | select(.key | endswith("TotalDataXfer-In-Bytes")) | .amount | tonumber] | add // 0' <<<"$transfer_records")"
   BILLED_OUT_GB="$(jq -r '[.[] | select(.key | endswith("TotalDataXfer-Out-Bytes")) | .amount | tonumber] | add // 0' <<<"$transfer_records")"
+  DAILY_TRANSFER_JSON="$(jq -c '[
+    .ResultsByTime[]
+    | {
+        date: .TimePeriod.Start,
+        inbound: ([.Groups[]?
+          | select((.Keys | type) == "array" and (.Keys | length) > 0)
+          | select(.Keys[0] | endswith("TotalDataXfer-In-Bytes"))
+          | .Metrics.UsageQuantity.Amount | tonumber] | add // 0),
+        outbound: ([.Groups[]?
+          | select((.Keys | type) == "array" and (.Keys | length) > 0)
+          | select(.Keys[0] | endswith("TotalDataXfer-Out-Bytes"))
+          | .Metrics.UsageQuantity.Amount | tonumber] | add // 0)
+      }
+  ]' <<<"$usage_json")"
   USED_GB="$(awk -v inbound="$BILLED_IN_GB" -v outbound="$BILLED_OUT_GB" 'BEGIN { printf "%.6f", inbound+outbound }')"
   if awk -v used="$USED_GB" 'BEGIN { exit !(used == 0) }'; then
     printf '警告: Cost Explorer 返回的流量为 0，账单数据可能仍在延迟。\n' >&2
@@ -174,6 +196,18 @@ print_section() {
     "$COLOR_BOLD" "$COLOR_CYAN" "$1" "$COLOR_RESET"
 }
 
+print_daily_breakdown() {
+  local date inbound outbound total
+
+  print_section '每日流量明细'
+  printf '%-12s %16s %16s %16s\n' '日期' '入站' '出站' '合计'
+  printf '%s\n' '──────────────────────────────────────────────────────────────'
+  while IFS=$'\t' read -r date inbound outbound; do
+    total="$(awk -v i="$inbound" -v o="$outbound" 'BEGIN { printf "%.3f", i+o }')"
+    printf '%-12s %12.3f GB %12.3f GB %12.3f GB\n' "$date" "$inbound" "$outbound" "$total"
+  done < <(jq -r '.[] | [.date, .inbound, .outbound] | @tsv' <<<"$DAILY_TRANSFER_JSON")
+}
+
 print_report() {
   local used_gb="$1" completed_days="$2" remaining_days="$3" current_count="$4"
   local difference=$((REQUIRED_INSTANCES - current_count))
@@ -201,6 +235,10 @@ print_report() {
   fi
   printf '截至昨天总流量: %.3f GB  (%s TiB)\n' "$used_gb" "$(format_tib "$used_gb")"
   printf '日均总流量: %.3f GB/天\n' "$DAILY_AVERAGE_GB"
+
+  if [[ "$SHOW_DAILY" == "true" ]]; then
+    print_daily_breakdown
+  fi
 
   print_section '月底预测'
   printf '预计剩余流量: %.3f GB  (%s TiB)\n' "$FORECAST_REMAINING_GB" "$(format_tib "$FORECAST_REMAINING_GB")"
@@ -236,6 +274,7 @@ while (( $# > 0 )); do
     --as-of) AS_OF="${2:?--as-of 缺少参数}"; shift 2 ;;
     --mock-used-gb) MOCK_USED_GB="${2:?--mock-used-gb 缺少参数}"; shift 2 ;;
     --current-count) CURRENT_COUNT="${2:?--current-count 缺少参数}"; shift 2 ;;
+    --daily) SHOW_DAILY="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "未知参数: $1" ;;
   esac
@@ -244,6 +283,7 @@ done
 require_command awk
 require_command date
 validate_inputs
+[[ "$SHOW_DAILY" != "true" || -z "$MOCK_USED_GB" ]] || die "--daily 不能与 --mock-used-gb 同时使用"
 
 DAY_OF_MONTH="$(date -u -d "$AS_OF" +%-d)"
 MONTH_START="$(date -u -d "$AS_OF" +%Y-%m-01)"
